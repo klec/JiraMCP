@@ -71,10 +71,21 @@ function renderInlineNode(node: AdfNode): string {
       return node.attrs?.timestamp ? new Date(Number(node.attrs.timestamp)).toISOString().slice(0, 10) : "";
     case "media":
     case "mediaInline":
-      return "[attachment]";
+      return mediaLabel(node);
     default:
       return renderInline(node.content);
   }
+}
+
+// Media nodes carry the media-service id, not the Jira attachment id, so the label
+// points at jira_list_attachments / jira_download_attachment instead of the raw id.
+function mediaLabel(node: AdfNode): string {
+  if (node.type !== "media" && node.type !== "mediaInline") {
+    return renderInline(node.content);
+  }
+
+  const name = node.attrs?.alt || node.attrs?.filename;
+  return `[attachment${name ? `: ${name}` : ""} — use jira_list_attachments / jira_download_attachment]`;
 }
 
 function applyMarks(text: string, marks: AdfNode["marks"]): string {
@@ -130,7 +141,7 @@ function renderBlock(node: AdfNode, options: AdfOptions, depth: number): string 
       return renderTable(node, options);
     case "mediaSingle":
     case "mediaGroup":
-      return "[attachment]";
+      return (node.content ?? []).map(mediaLabel).join(" ") || "[attachment]";
     case "expand":
     case "nestedExpand":
       return [node.attrs?.title ? `**${node.attrs.title}**` : "", renderChildren(node, options, depth)]

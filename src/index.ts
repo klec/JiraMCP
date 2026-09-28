@@ -2,11 +2,28 @@ import "dotenv/config";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { formatComment, formatComments, formatIssue, formatSearch, type CustomFieldMapping } from "./compact.js";
+import { mkdir, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import {
+  formatAttachments,
+  formatComment,
+  formatComments,
+  formatIssue,
+  formatSearch,
+  type CustomFieldMapping
+} from "./compact.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 const COMMENT_PAGE_SIZE = 100;
+// Bigger images blow up the context when base64-encoded, so they are only saved to disk.
+const MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024;
+const downloadDir = process.env.JIRA_ATTACHMENT_DIR?.trim() || path.join(os.tmpdir(), "jira-attachments");
+
+function sanitizeFileName(name: string): string {
+  return name.replace(/[^\w.\-]+/g, "_").slice(0, 100) || "attachment";
+}
 
 type JiraClientConfig = {
   baseUrl: string;
@@ -25,6 +42,7 @@ const BASE_ISSUE_FIELDS = [
   "reporter",
   "description",
   "issuelinks",
+  "attachment",
   "project",
   "labels",
   "created",
@@ -160,6 +178,41 @@ class JiraReadOnlyClient {
 
     const ordered = params.order === "desc" ? matched : matched.reverse();
     return { comments: ordered.slice(0, params.limit), total: matched.length };
+  }
+
+  // The issue-level attachment list covers both description files and images
+  // pasted into comments, since Jira stores them all on the issue.
+  async getAttachments(issueKey: string): Promise<any[]> {
+    const issue: any = await this.get(`/rest/api/3/issue/${encodeURIComponent(issueKey)}`, {
+      fields: "attachment"
+    });
+
+    return issue?.fields?.attachment ?? [];
+  }
+
+  async getAttachmentMeta(attachmentId: string): Promise<any> {
+    return this.get(`/rest/api/3/attachment/${encodeURIComponent(attachmentId)}`);
+  }
+
+  async downloadAttachment(attachmentId: string): Promise<{ data: Buffer; mimeType: string }> {
+    // Jira redirects attachment content to a signed media URL; fetch follows it and
+    // drops the Authorization header cross-origin, which that URL does not need.
+    const url = `${this.baseUrl}/rest/api/3/attachment/content/${encodeURIComponent(attachmentId)}`;
+    const response = await fetch(url, {
+      headers: { Authorization: `Basic ${this.authHeader}` },
+      redirect: "follow"
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Jira attachment download failed (${response.status} ${response.statusText}) for attachment ${attachmentId}`
+      );
+    }
+
+    return {
+      data: Buffer.from(await response.arrayBuffer()),
+      mimeType: (response.headers.get("content-type") ?? "application/octet-stream").split(";")[0].trim()
+    };
   }
 
   async getConfluencePage(pageId: string): Promise<JsonValue> {
@@ -430,6 +483,73 @@ async function main() {
           full: full ?? false
         })
       );
+    }
+  );
+
+  server.registerTool(
+    "jira_list_attachments",
+    {
+      title: "List Jira attachments",
+      description:
+        "List every file attached to a Jira issue — both files on the description and images pasted into " +
+        "comments — with the attachment ids needed by jira_download_attachment.",
+      inputSchema: {
+        issueKey: z.string().min(2),
+        raw: rawFlag
+      }
+    },
+    async ({ issueKey, raw }) => {
+      const attachments = await client.getAttachments(issueKey);
+      return raw ? toTextResult(attachments) : toMarkdownResult(formatAttachments(attachments, issueKey));
+    }
+  );
+
+  server.registerTool(
+    "jira_download_attachment",
+    {
+      title: "Download Jira attachment",
+      description:
+        "Download an attachment (e.g. a screenshot) by its id from jira_list_attachments. Saves it to disk and, " +
+        "for images, also returns the image itself so it can be looked at directly.",
+      inputSchema: {
+        attachmentId: z.string().min(1).describe("Attachment id from jira_list_attachments."),
+        outputPath: z
+          .string()
+          .optional()
+          .describe("Where to save the file; defaults to JIRA_ATTACHMENT_DIR or the system temp dir."),
+        inline: z
+          .boolean()
+          .optional()
+          .describe("Return the image content as well (default true for images under the size limit).")
+      }
+    },
+    async ({ attachmentId, outputPath, inline }) => {
+      const meta = await client.getAttachmentMeta(attachmentId);
+      const { data, mimeType } = await client.downloadAttachment(attachmentId);
+      const resolvedMime = meta?.mimeType || mimeType;
+      const target = outputPath
+        ? path.resolve(outputPath)
+        : path.join(downloadDir, `${attachmentId}-${sanitizeFileName(meta?.filename ?? attachmentId)}`);
+
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, data);
+
+      const isImage = resolvedMime.startsWith("image/");
+      const tooLarge = data.byteLength > MAX_INLINE_IMAGE_BYTES;
+      const content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [
+        {
+          type: "text",
+          text:
+            `Saved ${meta?.filename ?? attachmentId} (${resolvedMime}, ${data.byteLength} bytes) to ${target}` +
+            (isImage && tooLarge ? "\nImage not inlined: larger than the inline limit; read the saved file instead." : "")
+        }
+      ];
+
+      if (isImage && !tooLarge && inline !== false) {
+        content.push({ type: "image", data: data.toString("base64"), mimeType: resolvedMime });
+      }
+
+      return { content };
     }
   );
 

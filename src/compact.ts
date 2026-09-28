@@ -88,6 +88,10 @@ export function formatIssue(issue: any, customFields: CustomFieldMapping[]): str
   const description = fieldValue(fields.description, { full: true });
   lines.push("", "## Description", description || "_(empty)_");
 
+  if ((fields.attachment ?? []).length) {
+    lines.push("", formatAttachments(fields.attachment, issue.key));
+  }
+
   for (const { id, alias } of customFields) {
     const value = fieldValue(fields[id], { full: true });
     if (value) {
@@ -96,6 +100,55 @@ export function formatIssue(issue: any, customFields: CustomFieldMapping[]): str
   }
 
   return lines.join("\n");
+}
+
+function fileSize(bytes: unknown): string {
+  const size = Number(bytes);
+  if (!Number.isFinite(size)) {
+    return "—";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  let value = size;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+
+  return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+}
+
+// Jira keeps one attachment list per issue: files dropped on the description and
+// images pasted into comments both land here, so a single table covers both.
+export function formatAttachments(attachments: any[], issueKey: string): string {
+  const header = `## Attachments (${attachments.length}) — ${issueKey}`;
+
+  if (!attachments.length) {
+    return `${header}\n\n_(none)_`;
+  }
+
+  const rows = attachments.map((attachment) => {
+    const cells = [
+      attachment.id,
+      attachment.filename ?? "",
+      attachment.mimeType ?? "",
+      fileSize(attachment.size),
+      userName(attachment.author),
+      shortDate(attachment.created)
+    ].map((cell) => String(cell).replace(/\|/g, "\\|"));
+    return `| ${cells.join(" | ")} |`;
+  });
+
+  return [
+    header,
+    "",
+    "| Id | Filename | Type | Size | Author | Created |",
+    "|---|---|---|---|---|---|",
+    ...rows,
+    "",
+    "Download one with jira_download_attachment (attachmentId from the Id column)."
+  ].join("\n");
 }
 
 function truncate(text: string, maxLength: number, commentId: string): string {
