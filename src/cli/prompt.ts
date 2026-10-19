@@ -1,7 +1,32 @@
 import readline from "node:readline";
 
 const isTTY = process.stdin.isTTY === true;
+// `--stdin` reads one answer per line from piped input, for scripted setup and tests.
+const scripted = !isTTY && process.argv.includes("--stdin");
+let scriptedLines: AsyncIterator<string> | undefined;
 
+/**
+ * Reads the next answer line from piped stdin; the whole input shares one readline interface so
+ * lines buffered ahead of a question are not lost.
+ *
+ * @returns The next line of input.
+ */
+async function nextScriptedLine(): Promise<string> {
+  scriptedLines ??= readline.createInterface({ input: process.stdin })[Symbol.asyncIterator]();
+  const next = await scriptedLines.next();
+
+  if (next.done) {
+    throw new Error("The piped input ended before every question was answered.");
+  }
+
+  return next.value;
+}
+
+/**
+ * Writes to stdout, which is free to use in the setup wizard (it is not the MCP channel).
+ *
+ * @param text Text to print.
+ */
 function write(text: string) {
   process.stdout.write(text);
 }
@@ -23,10 +48,22 @@ type AskOptions = {
   validate?: (value: string) => string | undefined;
 };
 
+/**
+ * Creates a readline interface on stdin/stdout.
+ * @returns A readline interface; terminal mode follows isTTY.
+ */
 function createInterface(): readline.Interface {
   return readline.createInterface({ input: process.stdin, output: process.stdout, terminal: isTTY });
 }
 
+/**
+ * Asks one question; with secret the typed characters are not echoed.
+ *
+ * @param rl Readline interface.
+ * @param query Prompt text.
+ * @param secret Do not echo the typed characters.
+ * @returns The raw answer.
+ */
 function question(rl: readline.Interface, query: string, secret: boolean): Promise<string> {
   return new Promise((resolve) => {
     if (!secret) {
@@ -56,17 +93,34 @@ function question(rl: readline.Interface, query: string, secret: boolean): Promi
   });
 }
 
+/**
+ * Prompts until the answer passes validation; fails when there is no TTY (unless --stdin is given).
+ *
+ * @param label Question text.
+ * @param options Default value, secret mode and validation.
+ * @returns The trimmed answer, or the default when it is empty.
+ */
 export async function ask(label: string, options: AskOptions = {}): Promise<string> {
-  if (!isTTY) {
+  if (!isTTY && !scripted) {
     throw new Error("Interactive setup needs a TTY. Run `npx jira-mcp-add` from a terminal.");
   }
 
-  const rl = createInterface();
+  const rl = scripted ? undefined : createInterface();
 
   try {
     for (;;) {
       const suffix = options.defaultValue ? styles.dim(` [${options.defaultValue}]`) : "";
-      const raw = await question(rl, `${styles.cyan("?")} ${label}${suffix}: `, options.secret === true);
+      const prompt = `${styles.cyan("?")} ${label}${suffix}: `;
+      let raw: string;
+
+      if (rl) {
+        raw = await question(rl, prompt, options.secret === true);
+      } else {
+        write(prompt);
+        raw = await nextScriptedLine();
+        write("\n");
+      }
+
       const value = raw.trim() || options.defaultValue?.trim() || "";
       const error = options.validate?.(value);
 
@@ -78,10 +132,17 @@ export async function ask(label: string, options: AskOptions = {}): Promise<stri
       return value;
     }
   } finally {
-    rl.close();
+    rl?.close();
   }
 }
 
+/**
+ * Asks a yes/no question and returns the answer as a boolean.
+ *
+ * @param label Question text.
+ * @param defaultValue Answer used when the user just presses Enter.
+ * @returns True for yes.
+ */
 export async function confirm(label: string, defaultValue = true): Promise<boolean> {
   const answer = await ask(`${label} ${styles.dim(defaultValue ? "(Y/n)" : "(y/N)")}`, {
     defaultValue: defaultValue ? "y" : "n",
@@ -91,10 +152,19 @@ export async function confirm(label: string, defaultValue = true): Promise<boole
   return /^(y|yes)$/i.test(answer);
 }
 
+/**
+ * Shows a numbered list and returns the value of the chosen entry.
+ *
+ * @param label Question text.
+ * @param choices Options, each with an optional hint.
+ * @returns The value of the chosen option.
+ */
 export async function select(label: string, choices: { value: string; hint?: string }[]): Promise<string> {
   write(`${styles.cyan("?")} ${label}\n`);
   choices.forEach((choice, index) => {
-    write(`  ${styles.bold(String(index + 1))}. ${choice.value}${choice.hint ? styles.dim(` — ${choice.hint}`) : ""}\n`);
+    write(
+      `  ${styles.bold(String(index + 1))}. ${choice.value}${choice.hint ? styles.dim(` — ${choice.hint}`) : ""}\n`
+    );
   });
 
   const answer = await ask("Choice", {

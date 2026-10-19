@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-import { readFile, writeFile, mkdir, access } from "node:fs/promises";
+import { writeFile, mkdir, access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { baseUrlProblem, basicAuthHeader } from "../auth.js";
+import { ensureGitIgnored, getIn, readJson, targets } from "./config-files.js";
+import { runList, runRemove } from "./manage.js";
 import { ask, confirm, log, select, styles } from "./prompt.js";
 
 const PACKAGE_NAME = "jira-readonly-mcp";
@@ -16,65 +19,29 @@ type ServerEntry = {
   env: Record<string, string>;
 };
 
-type ConfigTarget = {
-  id: string;
-  label: string;
-  hint: string;
-  file: string;
-  // Where the server map lives inside the file; differs between clients.
-  pathInFile: string[];
-  gitIgnorable: boolean;
-};
-
-function targets(cwd: string): ConfigTarget[] {
-  return [
-    {
-      id: "claude-project",
-      label: "Claude Code — this project",
-      hint: ".mcp.json, shared with everyone who opens the repo",
-      file: path.join(cwd, ".mcp.json"),
-      pathInFile: ["mcpServers"],
-      gitIgnorable: true
-    },
-    {
-      id: "cursor-project",
-      label: "Cursor — this project",
-      hint: ".cursor/mcp.json",
-      file: path.join(cwd, ".cursor", "mcp.json"),
-      pathInFile: ["mcpServers"],
-      gitIgnorable: true
-    },
-    {
-      id: "vscode-project",
-      label: "VS Code / Copilot — this project",
-      hint: ".vscode/mcp.json",
-      file: path.join(cwd, ".vscode", "mcp.json"),
-      pathInFile: ["servers"],
-      gitIgnorable: true
-    },
-    {
-      id: "claude-global",
-      label: "Claude Code — global (all projects)",
-      hint: "~/.claude.json",
-      file: path.join(os.homedir(), ".claude.json"),
-      pathInFile: ["mcpServers"],
-      gitIgnorable: false
-    }
-  ];
-}
-
+/**
+ * Adds https:// when missing and strips trailing slashes.
+ *
+ * @param value URL as typed by the user.
+ * @returns URL with a scheme and no trailing slash.
+ */
 function normalizeBaseUrl(value: string): string {
   const withScheme = /^https?:\/\//i.test(value) ? value : `https://${value}`;
   return withScheme.replace(/\/+$/, "");
 }
 
-function authHeader(email: string, apiToken: string): string {
-  return `Basic ${Buffer.from(`${email}:${apiToken}`).toString("base64")}`;
-}
-
+/**
+ * GETs a Jira endpoint as JSON; used for the wizard's project and field lookups.
+ *
+ * @param baseUrl Jira site URL.
+ * @param email Atlassian account email.
+ * @param apiToken Atlassian API token.
+ * @param endpoint Path with query, e.g. /rest/api/3/field.
+ * @returns Parsed JSON response; throws on a non-2xx status.
+ */
 async function jiraGet<T>(baseUrl: string, email: string, apiToken: string, endpoint: string): Promise<T> {
   const response = await fetch(`${baseUrl}${endpoint}`, {
-    headers: { Authorization: authHeader(email, apiToken), Accept: "application/json" }
+    headers: { Authorization: basicAuthHeader(email, apiToken), Accept: "application/json" }
   });
 
   if (!response.ok) {
@@ -84,34 +51,12 @@ async function jiraGet<T>(baseUrl: string, email: string, apiToken: string, endp
   return (await response.json()) as T;
 }
 
-async function readJson(file: string): Promise<Record<string, any>> {
-  try {
-    const raw = await readFile(file, "utf8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return {};
-    }
-
-    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`);
-  }
-}
-
-function getIn(root: Record<string, any>, keys: string[]): Record<string, any> {
-  let node = root;
-
-  for (const key of keys) {
-    if (!node[key] || typeof node[key] !== "object") {
-      node[key] = {};
-    }
-
-    node = node[key];
-  }
-
-  return node;
-}
-
+/**
+ * Whether the file is accessible.
+ *
+ * @param file Path to check.
+ * @returns True when the file is accessible.
+ */
 async function exists(file: string): Promise<boolean> {
   try {
     await access(file);
@@ -121,8 +66,10 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-// A checkout of this repo can be run straight from dist/, which avoids the npx
-// resolution step; an installed copy under node_modules should use npx instead.
+/**
+ * A checkout of this repo can be run straight from dist/, which avoids the npx resolution step; an installed copy under node_modules should use npx instead.
+ * @returns Path to dist/index.js of a local checkout, or undefined when running from node_modules.
+ */
 async function findLocalCheckout(): Promise<string | undefined> {
   const entry = path.resolve(fileURLToPath(import.meta.url), "..", "..", "index.js");
 
@@ -133,27 +80,14 @@ async function findLocalCheckout(): Promise<string | undefined> {
   return undefined;
 }
 
-async function ensureGitIgnored(cwd: string, entry: string) {
-  const file = path.join(cwd, ".gitignore");
-  let content = "";
-
-  try {
-    content = await readFile(file, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  }
-
-  if (content.split(/\r?\n/).some((line) => line.trim() === entry)) {
-    return false;
-  }
-
-  const prefix = content && !content.endsWith("\n") ? "\n" : "";
-  await writeFile(file, `${content}${prefix}${entry}\n`, "utf8");
-  return true;
-}
-
+/**
+ * Asks for the default project key, listing the available keys as a hint.
+ *
+ * @param baseUrl Jira site URL.
+ * @param email Atlassian account email.
+ * @param apiToken Atlassian API token.
+ * @returns Upper-cased project key, or an empty string.
+ */
 async function pickDefaultProject(baseUrl: string, email: string, apiToken: string): Promise<string> {
   type ProjectPage = { values?: { key: string; name: string }[] };
 
@@ -178,6 +112,14 @@ async function pickDefaultProject(baseUrl: string, email: string, apiToken: stri
   return value.toUpperCase();
 }
 
+/**
+ * Asks for field names and resolves them to JIRA_CUSTOM_FIELDS id:alias pairs.
+ *
+ * @param baseUrl Jira site URL.
+ * @param email Atlassian account email.
+ * @param apiToken Atlassian API token.
+ * @returns JIRA_CUSTOM_FIELDS value (id:alias pairs), empty when none were chosen.
+ */
 async function pickCustomFields(baseUrl: string, email: string, apiToken: string): Promise<string> {
   const wanted = await ask("Custom fields to expose, by display name, comma separated (optional)", {
     defaultValue: ""
@@ -188,7 +130,7 @@ async function pickCustomFields(baseUrl: string, email: string, apiToken: string
   }
 
   type Field = { id: string; name: string };
-  let fields: Field[] = [];
+  let fields: Field[];
 
   try {
     fields = await jiraGet<Field[]>(baseUrl, email, apiToken, "/rest/api/3/field");
@@ -199,9 +141,13 @@ async function pickCustomFields(baseUrl: string, email: string, apiToken: string
 
   const mappings: string[] = [];
 
-  for (const name of wanted.split(",").map((part) => part.trim()).filter(Boolean)) {
-    const match = fields.find((field) => field.name.toLowerCase() === name.toLowerCase())
-      ?? fields.find((field) => field.name.toLowerCase().includes(name.toLowerCase()));
+  for (const name of wanted
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)) {
+    const match =
+      fields.find((field) => field.name.toLowerCase() === name.toLowerCase()) ??
+      fields.find((field) => field.name.toLowerCase().includes(name.toLowerCase()));
 
     if (!match) {
       log.warn(`No field matches "${name}" — skipped.`);
@@ -222,11 +168,18 @@ async function pickCustomFields(baseUrl: string, email: string, apiToken: string
   return mappings.join(",");
 }
 
+/**
+ * Collects the Jira connection details and builds the MCP server entry.
+ *
+ * @param printOnly Skip the local checkout lookup so the entry always uses npx.
+ * @returns The server entry and a suggested server name.
+ */
 async function buildEntry(printOnly: boolean): Promise<{ entry: ServerEntry; suggestedName: string }> {
   const baseUrl = normalizeBaseUrl(
     await ask("Jira base URL", {
       defaultValue: process.env.JIRA_BASE_URL?.trim() || "",
-      validate: (value) => (value ? undefined : "Required, e.g. your-company.atlassian.net")
+      validate: (value) =>
+        value ? baseUrlProblem(normalizeBaseUrl(value)) : "Required, e.g. your-company.atlassian.net"
     })
   );
 
@@ -237,7 +190,7 @@ async function buildEntry(printOnly: boolean): Promise<{ entry: ServerEntry; sug
 
   log.note("Create a token at https://id.atlassian.com/manage-profile/security/api-tokens");
 
-  let apiToken = "";
+  let apiToken: string;
   let authenticated = false;
 
   for (;;) {
@@ -326,6 +279,13 @@ async function buildEntry(printOnly: boolean): Promise<{ entry: ServerEntry; sug
   return { entry, suggestedName: defaultProject ? `jira_${defaultProject.toLowerCase()}` : "jira" };
 }
 
+/**
+ * Configures one Jira instance; returns whether the user wants to add another.
+ *
+ * @param cwd Project directory the config is written relative to.
+ * @param printOnly Print the JSON instead of writing a config file.
+ * @returns True when the user wants to add another instance.
+ */
 async function addOne(cwd: string, printOnly: boolean): Promise<boolean> {
   const { entry, suggestedName } = await buildEntry(printOnly);
 
@@ -383,6 +343,7 @@ async function addOne(cwd: string, printOnly: boolean): Promise<boolean> {
   return await confirm("Add another Jira instance?", false);
 }
 
+/** Entry point of the setup wizard (--print only outputs the JSON; --list and --remove manage entries). */
 async function main() {
   const major = Number(process.versions.node.split(".")[0]);
 
@@ -391,8 +352,21 @@ async function main() {
   }
 
   const cwd = process.cwd();
-  const args = new Set(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const args = new Set(argv);
   const printOnly = args.has("--print");
+
+  if (args.has("--list")) {
+    log.title("jira-mcp-add --list");
+    process.exitCode = (await runList(cwd)) > 0 ? 1 : 0;
+    return;
+  }
+
+  if (args.has("--remove")) {
+    const next = argv[argv.indexOf("--remove") + 1];
+    await runRemove(cwd, next && !next.startsWith("--") ? next : undefined);
+    return;
+  }
 
   log.title("jira-mcp-add — read-only Jira MCP server setup");
   log.note(`Project: ${cwd}`);

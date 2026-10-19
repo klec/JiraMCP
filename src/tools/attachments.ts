@@ -1,0 +1,242 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { mkdir, readFile, realpath, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { z } from "zod";
+import type { ConfluenceClient } from "../confluence-client.js";
+import { MAX_DOWNLOAD_BYTES } from "../http.js";
+import type { JiraClient } from "../jira-client.js";
+import { downloadOutput } from "../structured.js";
+import { READ_ONLY_ANNOTATIONS } from "./shared.js";
+
+// Bigger images blow up the context when base64-encoded, so they are only saved to disk.
+const MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Makes an attachment name safe to use as a file name.
+ *
+ * @param name Original file name.
+ * @returns Name with unsafe characters replaced by _, at most 100 characters.
+ */
+export function sanitizeFileName(name: string): string {
+  return name.replace(/[^\w.-]+/g, "_").slice(0, 100) || "attachment";
+}
+
+/**
+ * Extra directories downloads may be saved into, from JIRA_ATTACHMENT_ROOTS (separated like PATH).
+ *
+ * @returns Absolute directory paths; empty when the variable is not set.
+ */
+function allowedRoots(): string[] {
+  return (process.env.JIRA_ATTACHMENT_ROOTS ?? "")
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => path.resolve(entry.replace(/^~(?=$|[\\/])/, os.homedir())));
+}
+
+/**
+ * Resolves symlinks in the deepest part of a path that exists, so a link cannot lead out of a root.
+ *
+ * @param target Absolute path that may not exist yet.
+ * @returns The path with its existing ancestors resolved.
+ */
+async function realPathOfExisting(target: string): Promise<string> {
+  const missing: string[] = [];
+  let current = target;
+  for (;;) {
+    try {
+      return path.join(await realpath(current), ...missing.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return target;
+      }
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Refuses a save location outside the download directory and the configured roots. Attachment
+ * content is untrusted, so a prompt-injected path must not be able to drop a file into e.g. ~/.config.
+ *
+ * @param target Absolute path the file would be written to.
+ * @param roots Directories saving is allowed in.
+ */
+async function assertInsideRoots(target: string, roots: string[]) {
+  const real = await realPathOfExisting(target);
+  for (const root of roots) {
+    const relative = path.relative(await realPathOfExisting(root), real);
+    if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+      return;
+    }
+  }
+
+  throw new Error(
+    `outputPath must be inside the download directory (${roots[0]}) or a directory listed in JIRA_ATTACHMENT_ROOTS`
+  );
+}
+
+/**
+ * Streams a file to disk through the given download and builds the tool result, inlining images that are small enough.
+ *
+ * @param file The attachment's identity and the mime type its metadata announced.
+ * @param options Where to save and whether to inline images.
+ * @param download Writes the content to the target path; overwrite is false for explicit output paths.
+ * @returns MCP tool result with the saved path and, for images, the image itself.
+ */
+async function saveDownload(
+  file: { mimeType?: string; id: string; filename?: string },
+  options: { downloadDir: string; outputPath?: string; inline?: boolean },
+  download: (target: string, overwrite: boolean) => Promise<{ bytes: number; mimeType: string }>
+) {
+  const { id, filename } = file;
+  const fileName = `${id}-${sanitizeFileName(filename ?? id)}`;
+  let target = path.join(options.downloadDir, fileName);
+
+  if (options.outputPath) {
+    const roots = [options.downloadDir, ...allowedRoots()];
+    const resolved = path.resolve(options.downloadDir, options.outputPath.replace(/^~(?=$|[\\/])/, os.homedir()));
+    const isDir = await stat(resolved).then(
+      (entry) => entry.isDirectory(),
+      () => false
+    );
+    target = isDir ? path.join(resolved, fileName) : resolved;
+    await assertInsideRoots(target, roots);
+  }
+
+  await mkdir(path.dirname(target), { recursive: true });
+  // Attachment content is untrusted, so an explicit path must not clobber an existing file
+  // (e.g. a shell profile); the default download dir is ours and may be overwritten.
+  const { bytes, mimeType: downloadedType } = await download(target, !options.outputPath);
+  const mimeType = file.mimeType || downloadedType;
+
+  const isImage = mimeType.startsWith("image/");
+  const tooLarge = bytes > MAX_INLINE_IMAGE_BYTES;
+  const content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [
+    {
+      type: "text",
+      text:
+        `Saved ${filename ?? id} (${mimeType}, ${bytes} bytes) to ${target}` +
+        (isImage && tooLarge ? "\nImage not inlined: larger than the inline limit; read the saved file instead." : "")
+    }
+  ];
+
+  const inlined = isImage && !tooLarge && options.inline !== false;
+  if (inlined) {
+    content.push({ type: "image", data: (await readFile(target)).toString("base64"), mimeType });
+  }
+
+  return {
+    content,
+    structuredContent: { path: target, filename, mimeType, bytes, inlined }
+  };
+}
+
+const outputPathParam = z
+  .string()
+  .optional()
+  .describe(
+    "File or existing directory to save into; must be inside JIRA_ATTACHMENT_DIR (or the system temp dir) or a " +
+      "directory from JIRA_ATTACHMENT_ROOTS, relative paths resolve there. Existing files are never overwritten."
+  );
+const inlineParam = z
+  .boolean()
+  .optional()
+  .describe("Return the image content as well (default true for images under the size limit).");
+
+/**
+ * Registers jira_download_attachment and confluence_download_attachment.
+ *
+ * @param server MCP server to add the tools to.
+ * @param jira Jira client used to fetch Jira files.
+ * @param confluence Confluence client used to fetch Confluence files.
+ * @param downloadDir Default directory to save into.
+ */
+export function registerAttachmentTools(
+  server: McpServer,
+  jira: JiraClient,
+  confluence: ConfluenceClient,
+  downloadDir: string
+) {
+  server.registerTool(
+    "jira_download_attachment",
+    {
+      title: "Download Jira attachment",
+      description:
+        "Download an attachment (e.g. a screenshot) by its id from jira_list_attachments. Saves it to disk and, " +
+        "for images, also returns the image itself so it can be looked at directly.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      outputSchema: downloadOutput,
+      inputSchema: {
+        attachmentId: z.string().min(1).describe("Attachment id from jira_list_attachments."),
+        issueKey: z
+          .string()
+          .optional()
+          .describe(
+            "Issue the attachment belongs to. Required when the server restricts projects (JIRA_ALLOWED_PROJECTS), " +
+              "because an attachment id alone does not reveal its project."
+          ),
+        outputPath: outputPathParam,
+        inline: inlineParam
+      }
+    },
+    async ({ attachmentId, issueKey, outputPath, inline }) => {
+      if (jira.allowedProjects) {
+        if (!issueKey) {
+          throw new Error("issueKey is required because the server restricts projects (JIRA_ALLOWED_PROJECTS)");
+        }
+
+        // Listing also applies the project check to the issue.
+        const attachments = await jira.getAttachments(issueKey);
+        if (!attachments.some((attachment) => String(attachment.id) === attachmentId)) {
+          throw new Error(`Attachment ${attachmentId} does not belong to ${issueKey}`);
+        }
+      }
+
+      const meta = await jira.getAttachmentMeta(attachmentId);
+      if (Number(meta?.size) > MAX_DOWNLOAD_BYTES) {
+        throw new Error(`Attachment ${attachmentId} is ${meta.size} bytes, above the ${MAX_DOWNLOAD_BYTES}-byte limit`);
+      }
+
+      return saveDownload(
+        { mimeType: meta?.mimeType, id: attachmentId, filename: meta?.filename },
+        { downloadDir, outputPath, inline },
+        (target, overwrite) => jira.downloadAttachment(attachmentId, target, overwrite)
+      );
+    }
+  );
+
+  server.registerTool(
+    "confluence_download_attachment",
+    {
+      title: "Download Confluence attachment",
+      description:
+        "Download a page attachment by its id from confluence_list_attachments. Saves it to disk and, for " +
+        "images, also returns the image itself.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      outputSchema: downloadOutput,
+      inputSchema: {
+        attachmentId: z.string().min(1).describe("Attachment id from confluence_list_attachments."),
+        outputPath: outputPathParam,
+        inline: inlineParam
+      }
+    },
+    async ({ attachmentId, outputPath, inline }) => {
+      const meta = await confluence.getAttachmentMeta(attachmentId);
+      if (Number(meta?.fileSize) > MAX_DOWNLOAD_BYTES) {
+        throw new Error(
+          `Attachment ${attachmentId} is ${meta.fileSize} bytes, above the ${MAX_DOWNLOAD_BYTES}-byte limit`
+        );
+      }
+
+      return saveDownload(
+        { mimeType: meta?.mediaType, id: attachmentId, filename: meta?.title },
+        { downloadDir, outputPath, inline },
+        (target, overwrite) => confluence.downloadAttachment(meta, target, overwrite)
+      );
+    }
+  );
+}

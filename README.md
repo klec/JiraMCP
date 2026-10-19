@@ -4,11 +4,15 @@ TypeScript MCP server for Jira Cloud with read-only access.
 
 ## Capabilities
 
-- Read a Jira issue by key
-- Search issues by JQL
+- Read a Jira issue by key (incl. parent, subtasks, links, components, configured custom fields)
+- Search issues by JQL, with `nextPageToken` pagination
 - List project issues
-- Read comments for an issue
-- Read transitions and issue metadata exposed by Jira REST GET endpoints
+- Read comments for an issue (newest first, date filter, truncation of large payloads)
+- List and download issue attachments (images are returned inline)
+- Find field ids (including `customfield_*`) by name, list projects, find users and the current user
+- Issue history (changelog), worklogs, available transitions, remote links, project components and versions
+- Statuses, issue types and priorities for JQL, saved filters (list and run), Agile boards, sprints and sprint issues
+- Read Confluence pages as Markdown, full-text search them (optionally per space) and list spaces and a space's pages
 
 This server does not expose any methods for creating or updating issues, comments, transitions, or any other Jira entities.
 
@@ -24,9 +28,15 @@ Required variables:
 
 Optional variables:
 
-- `JIRA_DEFAULT_PROJECT`
-- `JIRA_CUSTOM_FIELDS`
-- `JIRA_ATTACHMENT_DIR`
+- `JIRA_DEFAULT_PROJECT` — project used by `jira_get_project_issues` when no key is given
+- `JIRA_CUSTOM_FIELDS` — see below
+- `JIRA_ATTACHMENT_DIR` — where downloaded attachments go (default: `<tmp>/jira-attachments`)
+- `JIRA_ALLOWED_PROJECTS`, `CONFLUENCE_ALLOWED_SPACES` — comma-separated project / space keys; when set, the server reads nothing else, whatever the token can see (see _Restricting what the agent can read_)
+- `JIRA_MAX_RESPONSE_CHARS` — cap on a single Markdown result (default `60000`, `0` disables); longer results are cut with a hint on how to fetch the rest, `raw` output is never cut
+- `JIRA_MCP_DEBUG` — `1` logs every Atlassian request (method, path, status, duration, retries) to stderr; credentials are never logged
+- `JIRA_ATTACHMENT_ROOTS` — extra directories (separated like `PATH`) an explicit `outputPath` may point into; by default only `JIRA_ATTACHMENT_DIR` is allowed
+- `JIRA_ISSUE_CACHE_SECONDS` — how long issue and comment reads are reused (default `30`, `0` disables)
+- `MCP_TRANSPORT`, `MCP_HTTP_HOST`, `MCP_HTTP_PORT`, `MCP_HTTP_TOKEN`, `MCP_HTTP_RATE_LIMIT` — Streamable HTTP, see below
 
 ### Getting a Jira API token
 
@@ -53,7 +63,16 @@ Notes:
   the token on a dedicated Atlassian account with access to just those projects.
   The server is read-only regardless, but the token itself is not.
 - `JIRA_BASE_URL` is your site root, for example `https://your-company.atlassian.net`,
-  with no `/jira` or `/browse/...` suffix.
+  with no `/jira` or `/browse/...` suffix. It must be `https://`: Basic auth sends the
+  token with every request, so plain `http://` is refused (only `localhost` is allowed, for tests).
+- **Restricting what the agent can read.** The token sees everything its account sees, and a
+  prompt injection in one ticket could steer the agent elsewhere. `JIRA_ALLOWED_PROJECTS=ABC,XYZ`
+  and `CONFLUENCE_ALLOWED_SPACES=DOCS` make the server itself refuse the rest: issue and page
+  reads, JQL/CQL searches (the query is wrapped in a project/space filter), project, board, space
+  and attachment lookups. Limits: an issue that was moved to a project outside the list is only
+  caught on `jira_get_issue` (its other sub-resources are matched by the key you pass), sprint
+  issues from other projects are dropped from the listing, and `jira_download_attachment` needs
+  `issueKey` so the attachment can be tied to a project. Users, fields and statuses are not scoped.
 - Jira **Data Center / Server** (self-hosted) uses personal access tokens instead
   and is not covered by this setup.
 - Revoke a token on the same page the moment it leaks — for instance if it ends
@@ -74,13 +93,18 @@ Listed fields are requested by `jira_get_issue` and exposed under their alias in
 both `fields` and `renderedFields` (the latter holds the HTML rendering, which is
 usually the readable one). The raw ids stay in the response as well.
 
-To discover the ids available on a Jira instance, call `/rest/api/3/field` and
-match on the field name.
+To discover the ids available on a Jira instance, ask the agent to call
+`jira_list_fields` with a name filter (e.g. `query: "requirements"`).
 
 If the variable is unset, no custom fields are requested and only the base issue
 fields are returned.
 
 ## Install
+
+Requires Node.js 20+; Node 24 LTS is recommended. In a checkout the version is
+pinned for both [nvm](https://github.com/nvm-sh/nvm) (`.nvmrc`) and
+[Volta](https://volta.sh) (`volta` in `package.json`): run `nvm use` in the project
+directory, or let Volta switch automatically.
 
 ```bash
 npm install -D jira-readonly-mcp
@@ -112,6 +136,12 @@ own `package.json` is never touched.
 
 `npx jira-mcp-add --print` runs the same questions but prints the JSON instead
 of writing it, for pasting into a config by hand.
+`--stdin` reads one answer per line from piped input instead of a terminal, for scripted setup.
+
+`npx jira-mcp-add --list` shows every Jira entry found in the client config files and asks Jira
+whether its token still works (the token itself is never printed; the exit code is 1 when one was
+rejected). `npx jira-mcp-add --remove [name]` deletes an entry after confirmation, without touching
+the rest of the file.
 
 ## Run
 
@@ -122,8 +152,40 @@ run it manually:
 npx jira-mcp
 ```
 
-Started this way the server reads `JIRA_*` from the environment, including a
-`.env` file in the current directory.
+Started this way the server reads `JIRA_*` from the environment and from a `.env`
+file in the current directory, so each project can keep its own Jira settings. Only
+when the current directory has no `.env`, the one next to the server code (the
+project root of a checkout) is used instead; the two files are never mixed.
+Variables set by the client (its `env` config) take precedence over the file.
+
+### Streamable HTTP (one server for a team)
+
+By default the client starts the server over stdio. To run one shared server instead:
+
+```bash
+MCP_TRANSPORT=http MCP_HTTP_TOKEN=choose-a-long-random-string npx jira-mcp
+# listening on http://127.0.0.1:3000/mcp
+```
+
+Clients then connect to `http://<host>:3000/mcp` and send `Authorization: Bearer <token>`.
+
+- `MCP_HTTP_HOST` (default `127.0.0.1`) and `MCP_HTTP_PORT` (default `3000`) set the address.
+  Listening beyond loopback requires `MCP_HTTP_TOKEN`; the server refuses to start otherwise,
+  because every caller reads Jira with the configured account.
+- Stateless: `POST /mcp` only (GET answers 405). `GET /healthz` answers `ok` and `GET /health` answers
+  `{status, version, uptimeSeconds}`, both without a token, for health checks. Put it behind
+  TLS (a reverse proxy) when it leaves your machine; the token travels in a header.
+- The attachment download tools are not registered in this mode, since they would write to the
+  server's disk. `jira_list_attachments` and `confluence_list_attachments` still work.
+- The reference and issue caches are shared by all callers.
+- `MCP_HTTP_RATE_LIMIT` caps requests per minute from one client address (default `120`, `0`
+  disables). Excess requests get `429` with `Retry-After`. All callers use one Atlassian quota,
+  so one runaway agent cannot starve the rest. Behind a reverse proxy every request shares the
+  proxy's address, so the limit then applies to the whole team.
+- `GET /metrics` serves counters in the Prometheus text format (needs the token when one is set):
+  `jira_mcp_http_requests_total{status}`, `jira_mcp_rate_limited_total`,
+  `jira_mcp_atlassian_requests_total{status}` (retries included, `error` when there was no answer),
+  `jira_mcp_atlassian_retries_total`, `jira_mcp_atlassian_request_seconds_total`, uptime and version.
 
 For local development from a checkout:
 
@@ -137,15 +199,86 @@ npm run setup    # run the setup wizard from source
 ## MCP Tools
 
 - `jira_get_issue`
+- `jira_get_issue_context`
 - `jira_search_issues`
 - `jira_get_project_issues`
 - `jira_get_comments`
+- `jira_list_attachments`
+- `jira_download_attachment`
+- `jira_list_fields`
+- `jira_list_projects`
+- `jira_get_current_user`
+- `jira_find_users`
+- `jira_get_changelog`
+- `jira_get_worklogs`
+- `jira_list_transitions`
+- `jira_list_metadata`
+- `jira_get_project`
+- `jira_list_filters`
+- `jira_run_filter`
+- `jira_get_issue_links`
+- `jira_get_remote_links`
+- `jira_list_boards`
+- `jira_list_sprints`
+- `jira_get_sprint_issues`
 - `confluence_get_page`
+- `confluence_get_page_diff`
+- `confluence_get_space_tree`
+- `confluence_get_page_issues`
+- `confluence_find_pages_for_issue`
+- `confluence_get_page_children`
+- `confluence_get_page_comments`
+- `confluence_list_attachments`
+- `confluence_download_attachment`
+- `confluence_get_page_versions`
 - `confluence_search_pages`
 - `confluence_get_space_pages`
+- `confluence_list_spaces`
+
+## MCP Resources and Prompts
+
+Resources let a client attach an issue or page as context without a tool call:
+
+- `jira://issue/{key}` — an issue as Markdown, e.g. `jira://issue/ABC-123`
+- `confluence://page/{id}` — a page as Markdown, e.g. `confluence://page/123456`
+
+A body is served in parts of at most 40,000 characters, cut at a line. Every part but the last ends
+with the URI of the next one, e.g. `jira://issue/ABC-123/offset/39871` or
+`confluence://page/123456/offset/39871`; the issue resource holds the fields and description, and the
+comments come from `jira_get_comments`.
+
+Prompts are ready-made instructions that name the tools to call:
+
+- `summarize_issue` (`issueKey`) — state, decisions, open questions and next steps
+- `release_notes` (`jql`, optional `audience`) — release notes grouped by issue type
+- `summarize_page` (`pageId`) — key points and action items of a Confluence page
+
+## Structured output
+
+Every tool declares an `outputSchema` and returns `structuredContent` next to the Markdown text:
+the same compact fields the Markdown shows, as JSON, so clients can use the data without parsing
+tables. `raw: true` only changes the text part to the unprocessed Jira JSON.
+`jira_search_issues` also accepts `includeTotal` for an approximate total.
 
 ## Security model
 
-- The server uses Jira REST API GET endpoints only.
-- The HTTP client rejects non-GET methods at runtime.
-- No MCP tools for mutations are registered.
+- The server uses Jira/Confluence REST API GET endpoints (plus one read-only POST,
+  `search/approximate-count`, behind an allowlist); every request goes through
+  a single HTTP client (30 s per attempt, 45 s in total; retries on HTTP 429/502/503/504 honouring `Retry-After`, but never waiting past the 45 s).
+- No MCP tools for mutations are registered; every tool is annotated `readOnlyHint`.
+- Jira/Confluence text is untrusted: Markdown results end with a note saying so, `structuredContent`
+  carries `untrusted: true`, and the server instructions tell the client not to follow instructions found in it.
+- Issue and comment reads are cached for 30 s (`JIRA_ISSUE_CACHE_SECONDS`), so a repeated read can
+  be that stale.
+- The only local side effect is `jira_download_attachment` writing a file (off in HTTP mode). An explicit
+  `outputPath` never overwrites an existing file and must stay inside `JIRA_ATTACHMENT_DIR` or a
+  directory from `JIRA_ATTACHMENT_ROOTS` (symlinks are resolved), since attachment content is untrusted.
+  Downloads above 100 MB are refused.
+
+## Releasing
+
+1. Bump `version` in `package.json` (and `package-lock.json`) in a PR and merge it.
+2. Tag the merge commit and push the tag: `git tag v0.3.0 && git push origin v0.3.0`.
+3. The `Release` workflow checks the tag against `package.json`, runs lint and tests, publishes to
+   npm with provenance and creates a GitHub release with generated notes. It needs an
+   `NPM_TOKEN` repository secret (an npm automation token with publish rights).
